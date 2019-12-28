@@ -118,7 +118,8 @@ def train_net(args, ctx, pretrained, epoch, prefix, begin_epoch, end_epoch,
     logger.info('output shape %s' % pprint.pformat(out_shape_dict))
 
 
-    for k,v in arg_shape_dict.iteritems():
+    for k in arg_shape_dict:
+      v = arg_shape_dict[k]
       if k.find('upsampling')>=0:
         print('initializing upsampling_weight', k)
         arg_params[k] = mx.nd.zeros(shape=v)
@@ -177,6 +178,16 @@ def train_net(args, ctx, pretrained, epoch, prefix, begin_epoch, end_epoch,
         _metric = metric.RPNL1LossMetric(loss_idx=mid, weight_idx=mid+1, name='RPNL1Loss_head_s%s'%stride)
         eval_metrics.add(_metric)
         mid+=2
+      if config.CASCADE>0:
+        for _idx in range(config.CASCADE):
+          if stride in config.CASCADE_CLS_STRIDES:
+            _metric = metric.RPNAccMetric(pred_idx=mid, label_idx=mid+1, name='RPNAccCAS%d_s%s'%(_idx,stride))
+            eval_metrics.add(_metric)
+            mid+=2
+          if stride in config.CASCADE_BBOX_STRIDES:
+            _metric = metric.RPNL1LossMetric(loss_idx=mid, weight_idx=mid+1, name='RPNL1LossCAS%d_s%s'%(_idx,stride))
+            eval_metrics.add(_metric)
+            mid+=2
 
     # callback
     #means = np.tile(np.array(config.TRAIN.BBOX_MEANS), config.NUM_CLASSES)
@@ -191,6 +202,7 @@ def train_net(args, ctx, pretrained, epoch, prefix, begin_epoch, end_epoch,
     lr_epoch = [int(epoch) for epoch in lr_step.split(',')]
     lr_epoch_diff = [epoch - begin_epoch for epoch in lr_epoch if epoch > begin_epoch]
     lr_iters = [int(epoch * len(roidb) / input_batch_size) for epoch in lr_epoch_diff]
+    iter_per_epoch = int(len(roidb)/input_batch_size)
 
     lr_steps = []
     if len(lr_iters)==5:
@@ -205,12 +217,12 @@ def train_net(args, ctx, pretrained, epoch, prefix, begin_epoch, end_epoch,
     else:
       for li in lr_iters:
         lr_steps.append( (li, 0.1) )
-    #lr_steps = [ (20,0.1), (40, 0.1) ] #XXX
+    #lr_steps = [ (10,0.1), (20, 0.1) ] #XXX
 
     end_epoch = 10000
     logger.info('lr %f lr_epoch_diff %s lr_steps %s' % (lr, lr_epoch_diff, lr_steps))
     # optimizer
-    opt = optimizer.SGD(learning_rate=lr, momentum=0.9, wd=0.0005, rescale_grad=1.0/len(ctx), clip_gradient=None)
+    opt = optimizer.SGD(learning_rate=lr, momentum=0.9, wd=args.wd, rescale_grad=1.0/len(ctx), clip_gradient=None)
     initializer=mx.init.Xavier()
     #initializer = mx.init.Xavier(rnd_type='gaussian', factor_type="out", magnitude=2) #resnet style
 
@@ -225,29 +237,57 @@ def train_net(args, ctx, pretrained, epoch, prefix, begin_epoch, end_epoch,
       outs = []
       for stride in config.RPN_FEAT_STRIDE:
         num_anchors = config.RPN_ANCHOR_CFG[str(stride)]['NUM_ANCHORS']
-        _name = 'face_rpn_cls_score_stride%d_output' % stride
-        rpn_cls_score = all_layers[_name]
+        if config.CASCADE>0:
+          _name = 'face_rpn_cls_score_stride%d_output' % (stride)
+          cls_pred = all_layers[_name]
+          cls_pred = mx.symbol.Reshape(data=cls_pred, shape=(0, 2, -1, 0))
+
+          cls_pred = mx.symbol.SoftmaxActivation(data=cls_pred, mode="channel")
+          cls_pred = mx.symbol.Reshape(data=cls_pred, shape=(0, 2 * num_anchors, -1, 0))
+          outs.append(cls_pred)
+          _name = 'face_rpn_bbox_pred_stride%d_output' % stride
+          rpn_bbox_pred = all_layers[_name]
+          outs.append(rpn_bbox_pred)
+          if config.FACE_LANDMARK:
+            _name = 'face_rpn_landmark_pred_stride%d_output' % stride
+            rpn_landmark_pred = all_layers[_name]
+            outs.append(rpn_landmark_pred)
+          for casid in range(config.CASCADE):
+            if stride in config.CASCADE_CLS_STRIDES:
+              _name = 'face_rpn_cls_score_stride%d_cas%d_output' % (stride, casid)
+              cls_pred = all_layers[_name]
+              cls_pred = mx.symbol.Reshape(data=cls_pred, shape=(0, 2, -1, 0))
+              cls_pred = mx.symbol.SoftmaxActivation(data=cls_pred, mode="channel")
+              cls_pred = mx.symbol.Reshape(data=cls_pred, shape=(0, 2 * num_anchors, -1, 0))
+              outs.append(cls_pred)
+            if stride in config.CASCADE_BBOX_STRIDES:
+              _name = 'face_rpn_bbox_pred_stride%d_cas%d_output' % (stride, casid)
+              bbox_pred = all_layers[_name]
+              outs.append(bbox_pred)
+        else:
+          _name = 'face_rpn_cls_score_stride%d_output' % stride
+          rpn_cls_score = all_layers[_name]
 
 
-        # prepare rpn data
-        rpn_cls_score_reshape = mx.symbol.Reshape(data=rpn_cls_score,
-                                                  shape=(0, 2, -1, 0),
-                                                  name="face_rpn_cls_score_reshape_stride%d" % stride)
+          # prepare rpn data
+          rpn_cls_score_reshape = mx.symbol.Reshape(data=rpn_cls_score,
+                                                    shape=(0, 2, -1, 0),
+                                                    name="face_rpn_cls_score_reshape_stride%d" % stride)
 
-        rpn_cls_prob = mx.symbol.SoftmaxActivation(data=rpn_cls_score_reshape,
-                                                   mode="channel",
-                                                   name="face_rpn_cls_prob_stride%d" % stride)
-        rpn_cls_prob_reshape = mx.symbol.Reshape(data=rpn_cls_prob,
-                                                 shape=(0, 2 * num_anchors, -1, 0),
-                                                 name='face_rpn_cls_prob_reshape_stride%d' % stride)
-        _name = 'face_rpn_bbox_pred_stride%d_output' % stride
-        rpn_bbox_pred = all_layers[_name]
-        outs.append(rpn_cls_prob_reshape)
-        outs.append(rpn_bbox_pred)
-        if config.FACE_LANDMARK:
-          _name = 'face_rpn_landmark_pred_stride%d_output' % stride
-          rpn_landmark_pred = all_layers[_name]
-          outs.append(rpn_landmark_pred)
+          rpn_cls_prob = mx.symbol.SoftmaxActivation(data=rpn_cls_score_reshape,
+                                                     mode="channel",
+                                                     name="face_rpn_cls_prob_stride%d" % stride)
+          rpn_cls_prob_reshape = mx.symbol.Reshape(data=rpn_cls_prob,
+                                                   shape=(0, 2 * num_anchors, -1, 0),
+                                                   name='face_rpn_cls_prob_reshape_stride%d' % stride)
+          _name = 'face_rpn_bbox_pred_stride%d_output' % stride
+          rpn_bbox_pred = all_layers[_name]
+          outs.append(rpn_cls_prob_reshape)
+          outs.append(rpn_bbox_pred)
+          if config.FACE_LANDMARK:
+            _name = 'face_rpn_landmark_pred_stride%d_output' % stride
+            rpn_landmark_pred = all_layers[_name]
+            outs.append(rpn_landmark_pred)
       _sym = mx.sym.Group(outs)
       mx.model.save_checkpoint(prefix, epoch, _sym, arg, aux)
 
@@ -262,6 +302,9 @@ def train_net(args, ctx, pretrained, epoch, prefix, begin_epoch, end_epoch,
           print('lr change to', opt.lr,' in batch', mbatch, file=sys.stderr)
           break
 
+      if mbatch%iter_per_epoch==0:
+        print('saving checkpoint', mbatch, file=sys.stderr)
+        save_model(0)
       if mbatch==lr_steps[-1][0]:
         print('saving final checkpoint', mbatch, file=sys.stderr)
         save_model(0)
@@ -303,7 +346,7 @@ def parse_args():
     parser.add_argument('--end_epoch', help='end epoch of training', default=default.end_epoch, type=int)
     parser.add_argument('--lr', help='base learning rate', default=default.lr, type=float)
     parser.add_argument('--lr_step', help='learning rate steps (in epoch)', default=default.lr_step, type=str)
-    parser.add_argument('--no_ohem', help='disable online hard mining', action='store_true')
+    parser.add_argument('--wd', help='weight decay', default=default.wd, type=float)
     args = parser.parse_args()
     return args
 
@@ -315,7 +358,7 @@ def main():
     ctx = []
     cvd = os.environ['CUDA_VISIBLE_DEVICES'].strip()
     if len(cvd)>0:
-      for i in xrange(len(cvd.split(','))):
+      for i in range(len(cvd.split(','))):
         ctx.append(mx.gpu(i))
     if len(ctx)==0:
       ctx = [mx.cpu()]
